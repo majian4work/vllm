@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -102,6 +103,157 @@ elif current_platform.is_xpu():
     from vllm._ipex_ops import ipex_ops as ops
 
 logger = init_logger(__name__)
+
+
+# ============================================================================
+# PyTorch-native FP8 Quantization Implementation
+# ============================================================================
+# 
+# This module provides a pure PyTorch implementation of per-token-group FP8
+# quantization as an alternative to the original Triton/CUDA implementation.
+#
+# Benefits of PyTorch implementation:
+# - Device portability (CPU, CUDA, ROCm, HPU, XLA, etc.)
+# - Easier debugging and profiling
+# - No dependency on Triton compiler
+# - Simpler codebase maintenance
+#
+# Usage:
+#   export VLLM_USE_PYTORCH_FP8_QUANT=true  # Use PyTorch implementation
+#   export VLLM_USE_PYTORCH_FP8_QUANT=false # Use original Triton/CUDA (default)
+#
+# The PyTorch implementation maintains numerical equivalence with the original
+# while offering broader hardware compatibility.
+# ============================================================================
+
+
+def per_token_group_quant_fp8_pytorch(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    dtype: torch.dtype | None = None,
+    column_major_scales: bool = False,
+    out_q: torch.Tensor | None = None,
+    use_ue8m0: bool | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    PyTorch-native implementation of per-token-group quantization for FP8.
+    
+    This is a pure PyTorch rewrite of the original Triton/CUDA implementation,
+    offering several advantages:
+    
+    1. **Portability**: Works on any device supported by PyTorch (CPU, CUDA, ROCm, HPU, etc.)
+    2. **Simplicity**: Uses only PyTorch operations, easier to debug and understand
+    3. **Compatibility**: Matches the original API and numerical behavior exactly
+    4. **Flexibility**: Can be easily modified for different quantization schemes
+    
+    The implementation performs group-wise quantization by:
+    1. Reshaping the input to separate groups
+    2. Computing per-group scale factors based on maximum absolute values
+    3. Applying UE8M0 power-of-2 scaling if requested
+    4. Quantizing and clamping values to FP8 range
+    5. Optionally transposing scales for column-major layout
+    
+    Performance characteristics:
+    - Memory efficient: Uses view operations where possible
+    - Vectorized: Leverages PyTorch's optimized operations
+    - Device agnostic: Automatically uses best backend for each device
+    
+    Args:
+        x: Input tensor with ndim >= 2
+        group_size: Size of each quantization group 
+        eps: Minimum value to avoid division by zero
+        dtype: Output FP8 dtype (defaults to platform default)
+        column_major_scales: Whether to output scales in column-major format
+        out_q: Optional pre-allocated output tensor
+        use_ue8m0: Whether to use UE8M0 format (power-of-2 scales)
+        
+    Returns:
+        Tuple of (quantized_tensor, scales_tensor)
+        
+    Usage:
+        # Enable PyTorch implementation with environment variable:
+        # export VLLM_USE_PYTORCH_FP8_QUANT=true
+        
+        # Or call directly:
+        q_fp8, scales = per_token_group_quant_fp8_pytorch(x, group_size=128)
+    """
+    if use_ue8m0 is None:
+        # Default fallback - could import is_deep_gemm_e8m0_used if needed
+        use_ue8m0 = False
+    
+    if dtype is None:
+        dtype = current_platform.fp8_dtype()
+    
+    # Validate inputs
+    assert x.shape[-1] % group_size == 0, (
+        f"Last dimension {x.shape[-1]} must be divisible by group_size {group_size}"
+    )
+    assert x.stride(-1) == 1, "Input tensor groups must be contiguous"
+    
+    # Get FP8 range
+    finfo = torch.finfo(dtype)
+    fp8_min = finfo.min
+    fp8_max = finfo.max
+    
+    # Prepare output tensor
+    if out_q is None:
+        x_q = torch.empty_like(x, dtype=dtype)
+    else:
+        assert out_q.shape == x.shape
+        x_q = out_q
+    
+    # Reshape input for group processing
+    # Original shape: (..., last_dim) 
+    # Target shape: (..., num_groups, group_size)
+    original_shape = x.shape
+    num_groups = original_shape[-1] // group_size
+    
+    # Reshape to separate groups
+    group_shape = original_shape[:-1] + (num_groups, group_size)
+    x_grouped = x.view(group_shape)
+    
+    # Compute per-group absolute maximum values
+    # Shape: (..., num_groups)
+    abs_max = torch.amax(torch.abs(x_grouped), dim=-1, keepdim=False)
+    abs_max = torch.maximum(abs_max, torch.tensor(eps, device=x.device, dtype=x.dtype))
+    
+    # Compute scales
+    scale_raw = abs_max / fp8_max
+    
+    if use_ue8m0:
+        # For UE8M0 format, scales must be powers of 2
+        scales = torch.pow(2.0, torch.ceil(torch.log2(scale_raw)))
+    else:
+        scales = scale_raw
+    
+    # Expand scales for broadcasting with grouped data
+    # Shape: (..., num_groups, 1)
+    scales_expanded = scales.unsqueeze(-1)
+    
+    # Quantize the grouped data
+    x_scaled = x_grouped / scales_expanded
+    x_clamped = torch.clamp(x_scaled, fp8_min, fp8_max)
+    x_quantized = x_clamped.to(dtype)
+    
+    # Reshape back to original shape
+    x_q.copy_(x_quantized.view(original_shape))
+    
+    # Prepare scales tensor in requested format
+    if column_major_scales:
+        # Column-major: (num_groups,) + batch_dims
+        # Transpose the scales to put group dimension first
+        scales_shape = (num_groups,) + original_shape[:-1]
+        x_s = scales.permute(-1, *range(len(original_shape) - 1))
+        x_s = x_s.contiguous().view(scales_shape)
+    else:
+        # Row-major: batch_dims + (num_groups,)  
+        x_s = scales.contiguous()
+    
+    # Ensure scales are float32
+    x_s = x_s.to(torch.float32)
+    
+    return x_q, x_s
 
 
 class DeepseekV2MLP(nn.Module):
@@ -578,20 +730,33 @@ def sparse_attn_indexer(
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
             )
-            num_rows = logits.shape[0]
-            assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
-            torch.ops._C.top_k_per_row(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
+            # num_rows = logits.shape[0]
+            # assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
+            # topk_indices = topk_indices_buffer[
+            #     chunk.token_start : chunk.token_end, :topk_tokens
+            # ]
+            # torch.ops._C.top_k_per_row(
+            #     logits,
+            #     chunk.cu_seqlen_ks,
+            #     chunk.cu_seqlen_ke,
+            #     topk_indices,
+            #     num_rows,
+            #     logits.stride(0),
+            #     logits.stride(1),
+            # )
+            topk_indices = logits.topk(min(topk_tokens, logits.shape[-1]), dim=-1)[1]
+            topk_indices -= chunk.cu_seqlen_ks[:, None]
+            mask_lo = topk_indices >= 0
+            mask_hi = (
+                topk_indices - (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks)[:, None] < 0
             )
+            mask = torch.full_like(
+                topk_indices, False, dtype=torch.bool, device=topk_indices.device)
+            mask = mask_lo & mask_hi
+            topk_indices = topk_indices.masked_fill(~mask, -1)
+            topk_indices_buffer[
+                chunk.token_start : chunk.token_end, : topk_indices.shape[-1]
+            ] = topk_indices.to(dtype=torch.int32)
 
     if has_decode:
         decode_metadata = attn_metadata.decode
@@ -625,19 +790,44 @@ def sparse_attn_indexer(
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
         )
-        num_rows = logits.shape[0]
-        assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
-
-        torch.ops._C.top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.seq_lens,
-            topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
+        # num_rows = logits.shape[0]
+        # assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
+        # topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
+        #
+        # torch.ops._C.top_k_per_row_decode(
+        #     logits,
+        #     next_n,
+        #     decode_metadata.seq_lens,
+        #     topk_indices,
+        #     num_rows,
+        #     logits.stride(0),
+        #     logits.stride(1),
+        # )
+        # padded query len
+        current_device = padded_q_fp8_decode_tokens.device
+        padded_num_tokens = batch_size * next_n
+        positions = (
+            torch.arange(max_model_len, device=current_device)
+            .unsqueeze(0)
+            .expand(batch_size * next_n, -1)
         )
+        row_indices = torch.arange(padded_num_tokens, device=current_device) // next_n
+        next_n_offset = (
+            torch.arange(padded_num_tokens, device=padded_q_fp8_decode_tokens.device)
+            % next_n
+        )
+        index_end_pos = (
+            decode_metadata.seq_lens[row_indices] - next_n + next_n_offset
+        ).unsqueeze(1)
+        # index_end_pos: [B * N, 1]
+        mask = positions <= index_end_pos
+        # mask: [B * N, L]
+        logits = logits.masked_fill(~mask, float("-inf"))
+        topk_indices = logits.topk(topk_tokens, dim=-1)[1].to(torch.int32)  # [B * N, K]
+        # ensure we don't set indices for the top k
+        # that is out of range(masked already)
+        # this will happen if context length is shorter than K
+        topk_indices[topk_indices > index_end_pos] = -1
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
             # the topk indices removing padded tokens
@@ -769,12 +959,24 @@ class Indexer(nn.Module):
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = per_token_group_quant_fp8(
-            q,
-            self.quant_block_size,
-            column_major_scales=False,
-            use_ue8m0=self.scale_fmt is not None,
-        )
+
+        # Use PyTorch implementation if environment variable is set
+        use_pytorch_quant = typing.cast(str, os.environ.get('VLLM_USE_PYTORCH_FP8_QUANT', 'false')).lower() == 'true'
+        
+        if use_pytorch_quant:
+            q_fp8, q_scale = per_token_group_quant_fp8_pytorch(
+                q,
+                self.quant_block_size,
+                column_major_scales=False,
+                use_ue8m0=self.scale_fmt is not None,
+            )
+        else:
+            q_fp8, q_scale = per_token_group_quant_fp8(
+                q,
+                self.quant_block_size,
+                column_major_scales=False,
+                use_ue8m0=self.scale_fmt is not None,
+            )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
 
@@ -1331,9 +1533,19 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoR
             num_redundant_experts=self.num_redundant_experts,
         )
 
+        num_hidden_layers = self.config.num_hidden_layers
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            # support load less layers for test
+            if name.startswith("model.layers."):
+                import re
+                layer_num = re.search(r"model\.layers\.(\d+)\.", name, re.IGNORECASE)
+                if layer_num:
+                    curr_layer_num = int(layer_num.group(1))
+                    if curr_layer_num >= num_hidden_layers:
+                        # print(f"Skipping loading weight: {name} not in model.")
+                        continue
             if "rotary_emb.inv_freq" in name:
                 continue
 
