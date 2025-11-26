@@ -113,6 +113,7 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
         q_c = None
         kv_lora = None
 
+        torch.hpu.synchronize()
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
                 "fused_qkv_a_proj is required when q_lora_rank is not None"
@@ -140,6 +141,7 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
+        torch.hpu.synchronize()
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
@@ -152,14 +154,19 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
         )
 
         if self.indexer and self.is_sparse:
+            torch.hpu.synchronize()
             _topk_indices = self.indexer(hidden_states, q_c, positions, self.rotary_emb)
+            torch.hpu.synchronize()
 
+        # print(f"hidden_states before mla attn shape: {hidden_states.shape}")
+        # print(f"q shape: {q.shape} kv_c_normed shape: {kv_c_normed.shape} k_pe shape: {k_pe.shape}")
         attn_out = self.mla_attn(
             q,
             kv_c_normed,
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
+        # print(f"MLA attn_out shape: {attn_out.shape}")
 
         return self.o_proj(attn_out)[0]
 
