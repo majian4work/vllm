@@ -741,11 +741,8 @@ def sparse_attn_indexer_pytorch(
     slot_mapping = attn_metadata.slot_mapping
     PAD_SLOT_ID = attn_metadata.PAD_SLOT_ID
     # print("slot_mapping in indexer:", slot_mapping)
-    # has_decode = attn_metadata.num_decodes > 0
-    # has_prefill = attn_metadata.num_prefills > 0
     has_decode = not attn_metadata.is_prompt
     has_prefill = attn_metadata.is_prompt
-    # num_decode_tokens = attn_metadata.num_decode_tokens
 
     # return
     batch_size = k.shape[0]
@@ -775,11 +772,8 @@ def sparse_attn_indexer_pytorch(
             logits, topk_tokens, cu_seqlen_ks, cu_seqlen_ke
         )
         topk_indices = topk_indices.view(-1, topk_indices.shape[-1])
-        # print("topk_indices:", topk_indices, "shape:", topk_indices.shape)
-        # print("topk_indices_buffer shape:", topk_indices_buffer.shape)
 
         topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1] ] = topk_indices.to(dtype=torch.int32)
-        # print(f"q_fp8 shape: {q_fp8.shape}")
         # print(f"topk_indices_buffer after prefill: {topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1]]}")
 
     # Handle decode phase
@@ -879,17 +873,12 @@ def _pytorch_indexer_k_quant_and_cache(
     # valid_k = k[valid_mask]
 
     # print(valid_k.shape, k_fp8.shape, k_scale.shape, kv_cache.shape, kv_cache[valid_slots].shape)
-    # k_fp8_bytes = k_fp8.view(-1, head_dim).view(torch.uint8)
-    # scale_bytes = k_scale.view(torch.uint8).view(-1, 4)
     # k_fp8_bytes = k_fp8[valid_mask].view(-1, head_dim).view(torch.uint8)
     # scale_bytes = k_scale[valid_mask].view(torch.uint8).view(-1, 4)
+
     k_fp8_bytes = k_fp8.view(-1, head_dim).view(torch.uint8)
     scale_bytes = k_scale.view(torch.uint8).view(-1, 4)
     fp8_bytes = torch.cat([k_fp8_bytes, scale_bytes], dim=-1)  # [total_tokens, head_dim + 4]
-    # htorch.core.mark_step()
-    # print("fp8_bytes:", fp8_bytes[:5, :10], "shape:", fp8_bytes.shape)
-    # print("slot_mapping shape:", slot_mapping.shape)
-    # print("kv_cache shape before indexing:", kv_cache.shape)
     
     # Use advanced indexing for efficient storage
     kv_cache = kv_cache.view(-1, head_dim + 4)
@@ -965,12 +954,13 @@ def _pytorch_fp8_mqa_logits(
     # print("weights:", weights[..., None], "shape:", weights[..., None].shape)
     # print("q_float:", q_float, "shape:", q_float.shape)
     # print("weighted_q:", weighted_q, "shape:", weighted_q.shape)
-    # print(weighted_q.shape)
+    # print("weighted_q shape:", weighted_q.shape)
     weights_sum = torch.sum(weighted_q, dim=-2)
     # print("weights_sum:", weights_sum)
     # print(weights_sum.shape, k_dequant.shape)
     logits = torch.matmul(weights_sum, k_dequant.squeeze(0).T)
-    # print("topk logits:", logits)
+    # print(f"topk logits shape: {logits.shape}")
+    # print("topk logits:", logits[:10, :20])
     # print(logits.shape)
     logits.relu_()
     return logits
@@ -983,8 +973,9 @@ def _pytorch_topk_with_bounds(
     cu_seqlen_ke: torch.Tensor,
 ) -> torch.Tensor:
     """PyTorch implementation of bounded top-k selection."""
-    batch_size = logits.shape[0]
-    seq_len = logits.shape[1]
+    seq_len = logits.shape[0]
+    # batch_size = logits.shape[0]
+    # seq_len = logits.shape[1]
     # print(f"cu_seqlen_ks: {cu_seqlen_ks}, cu_seqlen_ke: {cu_seqlen_ke}")
 
     # Get top-k indices
@@ -994,18 +985,24 @@ def _pytorch_topk_with_bounds(
 
     # start = cu_seqlen_ks[:, None]
     # end = cu_seqlen_ke[:, None]
-    mask = torch.zeros(logits.shape, dtype=torch.bool, device=logits.device)
-    for i, (b, e) in enumerate(zip(cu_seqlen_ks, cu_seqlen_ke)):
-        mask[i, b:e] = True
+
+    # BUG: need to support multi sequence
+    # mask = torch.zeros(logits.shape, dtype=torch.bool, device=logits.device)
+    # for i, (b, e) in enumerate(zip(cu_seqlen_ks, cu_seqlen_ke)):
+    #     mask[i, b:e] = True
+    mask = torch.triu(torch.ones(logits.shape, device=logits.device, dtype=torch.bool),
+                        diagonal=1)
     # print(f"position mask: {mask}")
 
     # Apply bounds masking before topk
-    logits = logits.masked_fill(~mask, float('-inf'))
+    # print("before mask logits:", logits[:10, :20])
+    logits = logits.masked_fill(mask, float('-inf'))
+    # print("after mask logits:", logits[:10, :20])
     
     # Get top-k indices
     topk_indices = logits.topk(min(topk_tokens, seq_len), dim=-1)[1]
     # print("logits shape:", logits.shape)
-    # print(f"topk_indices: {topk_indices} batch_size: {batch_size}, seq_len: {seq_len}")
+    # print(f"topk_indices: {topk_indices[:10, :100]}, seq_len: {seq_len}")
     
     topk_indices -= cu_seqlen_ks[:, None]
     # print(f"topk_indices after cu_seqlen_ks adjustment: {topk_indices}")
@@ -1016,8 +1013,9 @@ def _pytorch_topk_with_bounds(
     mask = mask_lo & mask_hi
     # print(f"final mask: {mask}")
     topk_indices = topk_indices.masked_fill(~mask, -1)
-    # print(f"topk_indices after masking: {topk_indices}")
-    
+    # print(f"topk_indices after masking: {topk_indices[:10, :100]}")
+    # raise
+
     return topk_indices
 
 
@@ -1064,9 +1062,9 @@ def _pytorch_fp8_paged_mqa_logits(
         batch_block_indices = torch.nonzero(idx, as_tuple=False).squeeze(-1)
         # print(f"batch_block_indices for batch {batch_idx}:", batch_block_indices)
         batch_block_list = block_list[batch_block_indices]
-        print(f"batch_block_list for batch {batch_idx}:", batch_block_list)
+        # print(f"batch_block_list for batch {batch_idx}:", batch_block_list)
         batch_block_usage = block_usage[batch_block_indices]
-        print(f"batch_block_usage for batch {batch_idx}:", batch_block_usage)
+        # print(f"batch_block_usage for batch {batch_idx}:", batch_block_usage)
         if batch_block_usage.sum().item() <= 0:
             # padding in batch_size
             continue
