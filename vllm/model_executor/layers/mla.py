@@ -166,9 +166,6 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
-        # print(f"MLA attn_out shape: {attn_out.shape}")
-        if attn_out.isnan().any():
-            raise
 
         return self.o_proj(attn_out)[0]
 
