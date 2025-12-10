@@ -995,8 +995,8 @@ def _pytorch_fp8_paged_mqa_logits(
             # print(f"flat_idx: {flat_idx}, q_vec shape: {q_vec.shape}")
 
             # Gather K values from paged cache
-            for i, (block_id, block_usage) in enumerate(zip(batch_block_list, batch_block_usage)):
-                for pos in range(int(block_usage.item())):
+            for i, (block_id, one_block_usage) in enumerate(zip(batch_block_list, batch_block_usage)):
+                for pos in range(int(one_block_usage.item())):
                     # print(f"i: {i}, block_id: {block_id}, block_usage:{block_usage}, pos: {pos}")
                     # Extract k and scale from cache
                     # [num_blocks, block_size, 1, head_dim+4]
