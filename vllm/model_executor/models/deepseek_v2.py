@@ -651,16 +651,18 @@ def sparse_attn_indexer_pytorch(
             k_fp8,
             k_scale,
             weights,
+            kv_cache,
+            attn_metadata,
         )
-        topk_indices = _pytorch_topk_with_bounds(logits, topk_tokens)
+        topk_indices = _pytorch_topk_with_bounds(logits, topk_tokens, attn_metadata)
         topk_indices = topk_indices.view(-1, topk_indices.shape[-1])
         topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1] ] = topk_indices.to(dtype=torch.int32)
     else:
         # PyTorch implementation of fp8_paged_mqa_logits
         logits = _pytorch_fp8_paged_mqa_logits(
             q_fp8,
-            kv_cache,
             weights,
+            kv_cache,
             attn_metadata,
             max_model_len,
         )
@@ -717,6 +719,8 @@ def _pytorch_fp8_mqa_logits(
     k_fp8: torch.Tensor,
     k_scale: torch.Tensor,
     weights: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata,
 ) -> torch.Tensor:
     """PyTorch implementation of fp8_mqa_logits.
 
@@ -726,6 +730,22 @@ def _pytorch_fp8_mqa_logits(
     # Convert k_scale from uint8 to float32 and dequantize k_fp8
     k_scale_f32 = k_scale.view(torch.float32)
     k_dequant = k_fp8.float() * k_scale_f32  # [total_k_len, head_dim]
+
+    ##### get prefix cache #####
+    if attn_metadata.block_list is not None:
+        print(f"block_mapping {attn_metadata.block_groups}")
+        raise
+        from vllm_gaudi.extension.utils import VLLMKVCache
+        _, head_dim = k_dequant.shape
+        indexer_cache_k = VLLMKVCache()
+        fetch_from_cache = indexer_cache_k.fetch_from_cache
+        past = fetch_from_cache(kv_cache, attn_metadata.block_list)
+        past_fp8_val = past[..., :head_dim].view(torch.float8_e4m3fn)
+        past_scale_val = past[..., head_dim:].view(torch.float32)
+        past_dequant = past_fp8_val.float() * past_scale_val
+        # print(f"past shape {past_dequant.shape}, curr shape {k_dequant.shape}")
+        k_dequant = torch.concat((past_dequant.view(-1, head_dim), k_dequant), dim=0)
+        torch.hpu.synchronize()
 
     q_float = q_fp8.float()  # [batch_size, num_heads, head_dim]
     weighted_q = weights[..., None] * q_float
@@ -738,12 +758,20 @@ def _pytorch_fp8_mqa_logits(
 def _pytorch_topk_with_bounds(
     logits: torch.Tensor,
     topk_tokens: int,
+    attn_metadata,
 ) -> torch.Tensor:
     """PyTorch implementation of bounded top-k selection."""
     seq_len = logits.shape[0]
+    diagonal = 1
+    # chunked prefill
+    if attn_metadata.context_lens_tensor is not None:
+        # Caution: only support batch_size = 1
+        seq_len += attn_metadata.context_lens_tensor.item()
+        diagonal += attn_metadata.context_lens_tensor.item()
+    print(f"seq_len {seq_len} diagonal {diagonal} logits shape {logits.shape}")
 
     mask = torch.triu(torch.ones(logits.shape, device=logits.device, dtype=torch.bool),
-                        diagonal=1)
+                        diagonal=diagonal)
 
     # Apply bounds masking before topk
     logits = logits.masked_fill(mask, float('-inf'))
@@ -751,14 +779,15 @@ def _pytorch_topk_with_bounds(
     # Get top-k indices
     topk_indices = logits.topk(min(topk_tokens, seq_len), dim=-1)[1]
     topk_indices = topk_indices.masked_fill(mask[:, :min(topk_tokens, seq_len)], -1)
+    print(f"topk_indices for prefill: {topk_indices[:5, :40]}")
 
     return topk_indices
 
 
 def _pytorch_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
-    kv_cache: torch.Tensor,
     weights: torch.Tensor,
+    kv_cache: torch.Tensor,
     attn_metadata,
     max_model_len: int,
 ) -> torch.Tensor:
@@ -766,10 +795,10 @@ def _pytorch_fp8_paged_mqa_logits(
 
     Args:
         q_fp8: Query tensor of shape [B, H, D]. Casted to `torch.float8_e4m3fn` by caller.
+        weights: Tensor of shape [B, H], dtype `torch.float32`.
         kv_cache_fp8: Paged KV-cache in packed FP8+scale layout with shape
             [num_blocks, block_size, D+4], dtype `torch.uint8`. The last
             4 bytes per (block,pos) store the `float` dequant scale.
-        weights: Tensor of shape [B, H], dtype `torch.float32`.
         max_model_len: Maximum sequence length used to size the logits output.
 
     Returns:
