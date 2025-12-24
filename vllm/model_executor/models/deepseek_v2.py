@@ -640,11 +640,14 @@ def sparse_attn_indexer_pytorch(
     is_prompt = attn_metadata.is_prompt
 
     # Initialize topk_indices_buffer
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # topk_indices_buffer[:q_fp8.shape[0], :] = -1
+    # topk_indices_buffer[:hidden_states.shape[0]] = -1
+    topk_indices_buffer.fill_(-1)
 
     k_fp8, k_scale = _pytorch_indexer_k_quant_and_cache(
         k, kv_cache, slot_mapping, quant_block_size, scale_fmt
     )
+
     if is_prompt:
         logits = _pytorch_fp8_mqa_logits(
             q_fp8,
@@ -671,7 +674,7 @@ def sparse_attn_indexer_pytorch(
         topk_indices = _pytorch_decode_topk_with_masking(
             logits,
             attn_metadata,
-            topk_tokens, padded_token_num, max_model_len
+            topk_tokens, padded_token_num
         )
         topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1]] = (
             topk_indices
@@ -703,11 +706,16 @@ def _pytorch_indexer_k_quant_and_cache(
     scale_bytes = k_scale.view(torch.uint8).view(-1, 4)
     fp8_bytes = torch.cat([k_fp8_bytes, scale_bytes], dim=-1)  # [total_tokens, head_dim + 4]
 
-    kv_cache = kv_cache.view(-1, head_dim + 4)
-    slot_mapping = slot_mapping.view(-1)
+    import habana_frameworks.torch.core as htcore
+    htcore.mark_step()
+    slot_mapping = slot_mapping.flatten()
 
-    # kv_cache[slot_mapping] = fp8_bytes
+    # from vllm_gaudi.extension.utils import VLLMKVCache
+    # indexer_cache_k = VLLMKVCache()
+    # indexer_cache_k(fp8_bytes, kv_cache, slot_mapping)
+    # kv_cache: [num_block*block_size, head_dim + 4]
     kv_cache.index_copy_(0, slot_mapping, fp8_bytes)
+    htcore.mark_step()
 
     return k_fp8, k_scale
 
@@ -723,15 +731,18 @@ def _pytorch_fp8_mqa_logits(
     Optimized with vectorized operations where possible.
     """
 
-    # Convert k_scale from uint8 to float32 and dequantize k_fp8
-    k_scale_f32 = k_scale.view(torch.float32)
-    k_dequant = k_fp8.float() * k_scale_f32  # [total_k_len, head_dim]
+    # q: [padded_token_num, num_heads, head_dim] [.., 64, 128]
+    # k: [padded_token_num, head_dim] [.., 128]
+    # weights: [padded_token_num, num_heads] [.., 64]
 
-    q_float = q_fp8.float()  # [batch_size, num_heads, head_dim]
-    weighted_q = weights[..., None] * q_float
-    weights_sum = torch.sum(weighted_q, dim=-2)
-    logits = torch.matmul(weights_sum, k_dequant.squeeze(0).T)
-    logits.relu_()
+    q_float = q_fp8.float()  # [padded_token_num, num_heads, head_dim]
+    k_scale_f32 = k_scale.view(torch.float32)
+    k_dequant = k_fp8.float() * k_scale_f32  # [padded_token_num, head_dim]
+
+    logits = torch.matmul(q_float, k_dequant.T).relu()  # [padded_token_num, num_heads, padded_token_num]
+    logits = logits * weights[..., None]
+    logits = logits.sum(dim=1)  # [padded_token_num, padded_token_num]
+
     return logits
 
 
@@ -781,20 +792,21 @@ def _pytorch_fp8_paged_mqa_logits(
     kv_cache = kv_cache.unsqueeze(-2)  # Add head dimension
     kv_heads = kv_cache.shape[-2]
 
-    block_groups = attn_metadata.block_groups
     block_list = attn_metadata.block_list
     block_mapping = attn_metadata.block_mapping
 
     from vllm_gaudi.extension.utils import VLLMKVCache
     from vllm_gaudi.extension.ops import batch2block
 
-    q_float = q_fp8.float() * weights[..., None]
+    q_float = q_fp8.float()
     q_float = batch2block(q_float, block_mapping.float()).unsqueeze(-2)
     # q_float: [padded_block_num, q_head, 1, head_dim] [:, 64, 1, 128]
+    weights = batch2block(weights, block_mapping.float()).unsqueeze(-2)
+    # weights: [padded_block_num, 1, q_head] [:, 1, 64]
 
     indexer_cache_k = VLLMKVCache()
     fetch_from_cache = indexer_cache_k.fetch_from_cache
-    key = fetch_from_cache(kv_cache, block_list)
+    key = fetch_from_cache(kv_cache.unflatten(0, (-1, attn_metadata.block_size)), block_list)
     # key: [padded_block_num, block_size, kv_head, head_dim+4] [:, 128, 1, 132]
 
     k_fp8_val = key[..., :head_dim].view(torch.float8_e4m3fn)
@@ -808,34 +820,40 @@ def _pytorch_fp8_paged_mqa_logits(
         # key: [padded_block_num, kv_head, block_size, head_dim] [:, 1, 128, 128]
         k_dequant = k_dequant.repeat_interleave(int(q_heads/kv_heads), dim=1)
 
-    attn = torch.matmul(q_float, k_dequant.transpose(-2, -1))
-    # attn: [padded_block_num, q_head, 1, block_size] [:, 64, 1, 128]
-    attn = attn.relu().sum(dim=1).squeeze(-2)
+    attn = torch.matmul(q_float, k_dequant.transpose(-2, -1)).squeeze(-2).relu()
+    # attn: [padded_block_num, q_head, block_size] [:, 64, 128]
+    attn = attn * weights.squeeze(-2)[..., None]
+    attn = attn.sum(dim=1) # [padded_block_num, block_size] [:, 128]
 
-    logits = torch.zeros(padded_token_num, max_model_len,
-                        device=q_fp8.device, dtype=torch.float32)
-    for token_idx in range(padded_token_num): # seq
-        idx = block_groups == token_idx
-        batch_block_indices = torch.nonzero(idx, as_tuple=False).squeeze(-1)
-        selected = attn[batch_block_indices].flatten()
-        logits[token_idx, :selected.shape[0]] = selected
+    # Gather logits per sequence naively for verification, which don't support static shapes
+    # logits = torch.zeros(padded_token_num, max_model_len,
+    #                     device=q_fp8.device, dtype=torch.float32)
+    # for token_idx in range(padded_token_num): # seq
+    #     idx = block_groups == token_idx
+    #     batch_block_indices = torch.nonzero(idx, as_tuple=False).squeeze(-1)
+    #     selected = attn[batch_block_indices].flatten()
+    #     logits[token_idx, :selected.shape[0]] = selected
 
-    return logits
-
+    device = q_fp8.device
+    num_blocks, block_size = attn.shape
+    logits = torch.zeros(padded_token_num, num_blocks, block_size, dtype=attn.dtype, device=device)
+    batch_block_mapping = attn_metadata.batch_block_mapping
+    torch.gather(attn.unsqueeze(0), 0, batch_block_mapping, out=logits)
+    return logits.view(padded_token_num, -1)
 
 def _pytorch_decode_topk_with_masking(
     logits: torch.Tensor,
     attn_metadata,
     topk_tokens: int,
     padded_token_num: int,
-    max_model_len: int,
 ) -> torch.Tensor:
     """PyTorch implementation of decode top-k with position masking."""
     current_device = logits.device
 
+    len = logits.shape[1]
     # Create position mask
     positions = (
-        torch.arange(max_model_len, device=current_device)
+        torch.arange(len, device=current_device)
         .unsqueeze(0)
         .expand(padded_token_num, -1)
     )
@@ -877,7 +895,6 @@ def sparse_attn_indexer(
             total_seq_lens, topk_indices_buffer
         )
 
-    # Original implementation (unchanged for compatibility)
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     if not isinstance(attn_metadata, dict):
@@ -1160,7 +1177,7 @@ class Indexer(nn.Module):
         return torch.ops.vllm.sparse_attn_indexer(
             hidden_states,
             self.k_cache.prefix,
-            self.k_cache.kv_cache[0],
+            self.k_cache.kv_cache[0][0],
             q_fp8,
             k,
             weights,

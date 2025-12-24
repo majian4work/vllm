@@ -45,7 +45,8 @@ class DeepseekV32IndexerBackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         assert num_kv_heads == 1
-        return (num_blocks, block_size, head_size)
+        # return (num_blocks, block_size, head_size)
+        return (num_blocks*block_size, head_size)
 
     @staticmethod
     def get_kv_cache_stride_order() -> tuple[int, ...]:
