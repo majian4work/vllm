@@ -27,6 +27,9 @@ class XPUModelRunner(GPUModelRunner):
             super().__init__(vllm_config, device)
         # FIXME: To be verified.
         self.cascade_attn_enabled = False
+        # HACK: override num_hidden_layers for testing
+        # torch.set_printoptions(edgeitems=150, linewidth=200)
+        vllm_config.model_config.hf_config.num_hidden_layers = 4
 
     def _init_device_properties(self) -> None:
         self.num_sms = None

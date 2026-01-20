@@ -128,8 +128,8 @@ def get_fp8_moe_backend(
     Select the primary FP8 MoE backend
     Note: Shape-specific fallbacks may still occur at runtime.
     """
-    if current_platform.is_xpu():
-        return None
+    # if current_platform.is_xpu():
+    #     return None
     if with_lora_support:
         return Fp8MoeBackend.TRITON
     # Prefer FlashInfer backends on supported GPUs; allow SM90 and SM100.

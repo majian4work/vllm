@@ -1040,6 +1040,7 @@ class DeepseekV2MLAAttention(nn.Module):
             self.scaling = self.scaling * mscale * mscale
 
         self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = False
 
         if self.is_v32:
             self.indexer_rope_emb = get_rope(
@@ -1254,6 +1255,7 @@ class DeepseekV2Model(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = False
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1531,9 +1533,20 @@ class DeepseekV2ForCausalLM(
             num_redundant_experts=self.num_redundant_experts,
         )
 
+        num_hidden_layers = self.config.num_hidden_layers
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            # support load less layers for test
+            if name.startswith("model.layers."):
+                import re
+                layer_num = re.search(r"model.layers\.(\d+)\.", name, re.IGNORECASE)
+                if layer_num:
+                    curr_layer_num = int(layer_num.group(1))
+                    if curr_layer_num >= num_hidden_layers:
+                        # print(f"Skipping loading weight: {name} not in model.")
+                        continue
+
             if "rotary_emb.inv_freq" in name:
                 continue
 

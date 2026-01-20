@@ -14,6 +14,7 @@ from vllm.platforms import current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.xpu_model_runner import XPUModelRunner
+from vllm.v1.worker.workspace import init_workspace_manager
 
 logger = init_logger(__name__)
 
@@ -167,6 +168,10 @@ class XPUWorker(Worker):
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
+
+        # Initialize workspace manager
+        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
         self.model_runner = XPUModelRunner(  # type: ignore
