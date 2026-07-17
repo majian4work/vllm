@@ -160,6 +160,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -234,6 +235,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             return_bias=False,
             prefix=f"{prefix}.wo_b",
         )

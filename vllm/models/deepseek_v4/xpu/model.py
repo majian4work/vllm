@@ -15,6 +15,8 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_reduce_scatter,
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -57,6 +59,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    sequence_parallel_chunk,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.xpu.xpu_sparse import DeepseekV4XPUAttention
@@ -604,10 +607,12 @@ class DeepseekV4MoE(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        is_sequence_parallel: bool = False,
     ):
         super().__init__()
 
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.is_sequence_parallel = is_sequence_parallel
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
@@ -619,6 +624,11 @@ class DeepseekV4MoE(nn.Module):
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
                 "Enable it with --enable-expert-parallel, or pick a different "
                 "moe backend."
+            )
+        if self.use_mega_moe and self.is_sequence_parallel:
+            raise NotImplementedError(
+                "DeepSeek V4 MegaMoE does not support sequence parallelism "
+                "on XPU. Use the FusedMoE backend instead."
             )
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
@@ -684,6 +694,7 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
                 reduce_results=self.use_mega_moe,
+                is_sequence_parallel=self.is_sequence_parallel,
                 prefix=f"{prefix}.shared_experts",
             )
 
@@ -746,6 +757,7 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
+            is_sequence_parallel=self.is_sequence_parallel,
         )
 
     def forward(
@@ -829,7 +841,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         import vllm.model_executor.layers.mhc  # noqa: F401
 
         config = vllm_config.model_config.hf_config
+        parallel_config = vllm_config.parallel_config
         self.hidden_size = config.hidden_size
+
+        # Sequence parallelism: when enabled, attention output is
+        # reduce-scattered (T→T/tp) and MoE operates on T/tp tokens.
+        self.use_sequence_parallel = (
+            parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+        )
+        self.tp_size = get_tensor_model_parallel_world_size()
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4XPUAttention(
@@ -837,8 +858,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            reduce_results=not self.use_sequence_parallel,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        self.ffn = DeepseekV4MoE(
+            vllm_config,
+            prefix=f"{prefix}.ffn",
+            is_sequence_parallel=self.use_sequence_parallel,
+        )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -934,13 +960,22 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
+        full_num_tokens = positions.shape[0]
+        # Detect if we are already in SP state (residual is T/tp from prev layer)
+        input_is_sp = (
+            self.use_sequence_parallel
+            and residual is not None
+            and residual.shape[0] != full_num_tokens
+        )
+
         if residual is None:
-            # First layer: run standalone hc_pre
+            # First layer: run standalone hc_pre on full T
             residual = x
             x, post_mix, res_mix = self.hc_pre(
                 x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
         else:
+            # MHC fused_post_pre: all inputs same shape (T or T/tp)
             residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
                 x,
                 residual,
@@ -955,9 +990,31 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
             )
+            # SP: all-gather x from T/tp → T for attention
+            if input_is_sp:
+                x = tensor_model_parallel_all_gather(x, 0)
+                x = x[:full_num_tokens]
 
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
+
+        # SP: reduce-scatter attention output T → T/tp, chunk residual
+        if self.use_sequence_parallel:
+            # Pad to make divisible by tp_size
+            sp_pad = (-x.shape[0]) % self.tp_size
+            x = torch.nn.functional.pad(x, (0, 0, 0, sp_pad))
+            x = tensor_model_parallel_reduce_scatter(x, 0)
+            if not input_is_sp:
+                # First time entering SP: chunk the residual stream along dim 0
+                residual = sequence_parallel_chunk(residual.flatten(1)).unflatten(
+                    1, residual.shape[1:]
+                )
+                post_mix = sequence_parallel_chunk(post_mix.flatten(1)).unflatten(
+                    1, post_mix.shape[1:]
+                )
+                res_mix = sequence_parallel_chunk(res_mix.flatten(1)).unflatten(
+                    1, res_mix.shape[1:]
+                )
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
@@ -974,6 +1031,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
         )
         x = self.ffn_norm(x)
+        # SP: chunk input_ids to match local T/tp tokens for hash MoE routing
+        if self.use_sequence_parallel and input_ids is not None:
+            input_ids = sequence_parallel_chunk(input_ids.unsqueeze(-1)).squeeze(-1)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
@@ -984,17 +1044,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        parallel_config = vllm_config.parallel_config
         quant_config = vllm_config.quant_config
         self.config = config
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
-        if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
+        if self.use_mega_moe and not parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
                 "Enable it with --enable-expert-parallel, or pick a different "
                 "moe backend."
             )
+        self.use_sequence_parallel = (
+            parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+        )
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
         self.hc_mult = config.hc_mult
@@ -1131,11 +1196,34 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
             )
             if idx + 1 in self.aux_hidden_state_layers:
-                aux_recon = layer.hc_post(hidden_states, residual, post_mix, res_mix)
+                if self.use_sequence_parallel:
+                    # All-gather for aux hidden states in SP mode
+                    ft = positions.shape[0]
+                    aux_hs = tensor_model_parallel_all_gather(hidden_states, 0)[:ft]
+                    aux_res = tensor_model_parallel_all_gather(residual, 0)[:ft]
+                    aux_pm = tensor_model_parallel_all_gather(post_mix, 0)[:ft]
+                    aux_rm = tensor_model_parallel_all_gather(res_mix, 0)[:ft]
+                    aux_recon = layer.hc_post(aux_hs, aux_res, aux_pm, aux_rm)
+                else:
+                    aux_recon = layer.hc_post(
+                        hidden_states, residual, post_mix, res_mix
+                    )
                 aux_hidden_states.append(aux_recon.mean(dim=1))
         # The fused path defers the final hc_post to the next layer's
         # fused_post_pre. After the last layer we must apply it explicitly.
         if layer is not None:
+            # SP: all-gather hidden_states and residual back to full T
+            # before the final hc_post (which needs full sequence for logits).
+            if self.use_sequence_parallel:
+                full_num_tokens = positions.shape[0]
+                hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+                hidden_states = hidden_states[:full_num_tokens]
+                residual = tensor_model_parallel_all_gather(residual, 0)
+                residual = residual[:full_num_tokens]
+                post_mix = tensor_model_parallel_all_gather(post_mix, 0)
+                post_mix = post_mix[:full_num_tokens]
+                res_mix = tensor_model_parallel_all_gather(res_mix, 0)
+                res_mix = res_mix[:full_num_tokens]
             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
