@@ -103,6 +103,110 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         )
         return self.wo_b(z.flatten(1))
 
+    def _o_proj_fused_rs(
+        self, o: torch.Tensor, positions: torch.Tensor, group_name: str
+    ) -> torch.Tensor:
+        """Output projection with fused GEMM + ReduceScatter via DeepSymm."""
+        from deep_symm import async_tp
+
+        from vllm.models.deepseek_v4.amd.rocm import rocm_inv_rope_einsum
+
+        z = rocm_inv_rope_einsum(
+            self.rotary_emb,
+            o,
+            positions,
+            self.rope_head_dim,
+            self.n_local_groups,
+            self.o_lora_rank,
+            self.wo_a,
+        )
+        # wo_b is RowParallelLinear: each rank has partial input, matmul gives
+        # partial result. fused_matmul_reduce_scatter sums partials and scatters.
+        return async_tp.fused_matmul_reduce_scatter(
+            z.flatten(1), self.wo_b.weight.t(), "sum", 0, group_name
+        )
+
+    def forward_sp_fused(
+        self,
+        positions: torch.Tensor,
+        hidden_states_local: torch.Tensor,
+        group_name: str,
+    ) -> torch.Tensor:
+        """SP-fused attention: AG+GEMM at input, GEMM+RS at output.
+
+        Args:
+            hidden_states_local: [N/tp, H] local chunk after attn_norm
+            group_name: TP group name for deep_symm collectives
+
+        Returns:
+            [N/tp, H] local chunk after fused wo_b + reduce_scatter
+        """
+        from deep_symm import async_tp
+
+        from vllm.models.deepseek_v4.attention import fused_q_kv_rmsnorm
+
+        # Fused AllGather + fused_wqa_wkv GEMM:
+        # Overlaps gathering tokens with computing the QKV projection.
+        # return_A=True → returns (gathered_input, [matmul_outputs])
+        weight = self.fused_wqa_wkv.weight  # [q_lora_rank+head_dim, H]
+        hidden_states, mm_outputs = async_tp.fused_all_gather_matmul(
+            hidden_states_local,
+            [weight.t()],
+            gather_dim=0,
+            group_name=group_name,
+            return_A=True,
+        )
+        qr_kv = mm_outputs[0]
+        num_tokens = qr_kv.shape[0]
+
+        # Split and norm
+        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        qr, kv = fused_q_kv_rmsnorm(
+            qr,
+            kv,
+            self.q_norm.weight.data,
+            self.kv_norm.weight.data,
+            self.eps,
+        )
+
+        # Attention computation (same as base forward)
+        o_padded = torch.empty(
+            (num_tokens, self.padded_heads, self.head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        # Run compressor/indexer GEMMs (they need full hidden_states)
+        kv_score, indexer_kv_score, indexer_weights = None, None, None
+        if self.compressor is not None:
+            kv_score = torch.mm(
+                hidden_states,
+                self.compressor.fused_wkv_wgate.weight.T,
+                out_dtype=torch.float32,
+            )
+        if self.indexer is not None:
+            indexer_weights, _ = self.indexer.weights_proj(hidden_states)
+            indexer_kv_score = torch.mm(
+                hidden_states,
+                self.indexer.compressor.fused_wkv_wgate.weight.T,
+                out_dtype=torch.float32,
+            )
+
+        self.attention_impl(
+            hidden_states,
+            qr,
+            kv,
+            kv_score,
+            indexer_kv_score,
+            indexer_weights,
+            positions,
+            o_padded,
+        )
+        o = o_padded[:, : self.n_local_heads, :]
+
+        # Fused wo_a + wo_b with ReduceScatter
+        return self._o_proj_fused_rs(o, positions, group_name)
+
     def forward_mqa(
         self,
         q: torch.Tensor,

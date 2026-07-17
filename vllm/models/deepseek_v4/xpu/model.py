@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os as _os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -67,6 +68,12 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+
+# Environment variable toggles for DeepSymm SP optimizations:
+# VLLM_SP_FUSE_COMMS=1  - Enable fused AG+GEMM / GEMM+RS for attention
+# VLLM_SP_USE_DEEPSYMM_MOE=1 - Enable DeepSymm SymmBuffer for MoE dispatch/combine
+_SP_FUSE_COMMS = _os.environ.get("VLLM_SP_FUSE_COMMS", "0") == "1"
+_SP_USE_DEEPSYMM_MOE = _os.environ.get("VLLM_SP_USE_DEEPSYMM_MOE", "0") == "1"
 
 
 class DeepseekV4MLP(nn.Module):
@@ -766,6 +773,10 @@ class DeepseekV4MoE(nn.Module):
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
+        # DeepSymm SP MoE path: fused allgather+permute / unpermute+reducescatter
+        if self.is_sequence_parallel and _SP_USE_DEEPSYMM_MOE:
+            return self.forward_deepsymm(hidden_states, input_ids)
+
         if not self.use_mega_moe:
             return self._forward_fused_moe(hidden_states, input_ids)
 
@@ -821,6 +832,152 @@ class DeepseekV4MoE(nn.Module):
 
         return final_hidden_states.view(org_shape)
 
+    def forward_deepsymm(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """MoE forward with DeepSymm SymmBuffer fused dispatch/combine.
+
+        Uses fused allgather_local_permute and unpermute_reducescatter
+        to overlap communication with expert permutation.
+        Requires the `deep_symm` package (specifically `symm_buffer`).
+        """
+        from symm_buffer import SymmBuffer
+
+        from vllm.distributed import get_tp_group
+
+        tp_group = get_tp_group()
+        tp_size = tp_group.world_size
+
+        # Route on local chunk
+        if self.gate.tid2eid is not None and input_ids is not None:
+            router_logits, _ = self.gate(hidden_states, input_ids=input_ids)
+        else:
+            router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids = fused_topk_bias(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            scoring_func=self.scoring_func,
+            e_score_correction_bias=self.gate.e_score_correction_bias.data
+            if self.gate.e_score_correction_bias is not None
+            else None,
+            topk=self.n_activated_experts,
+            renormalize=self.renormalize,
+            indices_type=self.hash_indices_dtype,
+            input_tokens=input_ids,
+            hash_indices_table=self.gate.tid2eid,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+
+        num_rows = hidden_states.size(0)
+        hidden_size = hidden_states.size(1)
+        n_experts_per_token = topk_ids.size(1)
+        num_experts = self.n_local_experts * tp_size
+        total_rows = num_rows * tp_size
+
+        # Lazily create/reuse SymmBuffer
+        if not hasattr(self, "_symm_buffer"):
+            self._symm_buffer: SymmBuffer | None = None
+        if self._symm_buffer is None:
+            self._symm_buffer = SymmBuffer(
+                group=tp_group.device_group,
+                num_max_tokens_per_rank=4096,
+                hidden=hidden_size,
+                num_topk=n_experts_per_token,
+            )
+        sbuf = self._symm_buffer
+
+        # Fused all_gather + permute to expert-grouped layout
+        remapped = torch.empty(
+            (total_rows * n_experts_per_token, hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        _, symm_handle = sbuf.allgather_local_permute_fusion(
+            hidden_shard=hidden_states,
+            topk_idx=topk_ids,
+            topk_weights=topk_weights,
+            num_experts=num_experts,
+            remap_hidden_states=remapped,
+        )
+        rows_per_expert = symm_handle.rows_per_expert
+
+        # Expert computation via cutlass grouped GEMM
+        # Access the underlying expert implementation
+        runner = self.experts.runner
+        mk = runner._quant_method.moe_kernel
+        experts = mk.fused_experts
+        if experts.fused_moe_impl is None:
+            # Force init via normal forward on first call
+            return self._forward_fused_moe(hidden_states, input_ids)
+        impl = experts.fused_moe_impl
+        num_moe_inputs = total_rows * n_experts_per_token
+
+        # GEMM1: gate_up projection
+        gemm1_out = torch.empty(
+            (num_moe_inputs, 2 * impl.inter_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+            ptr_A=remapped,
+            ptr_B=impl.w13,
+            ptr_scales=impl.gemm1_scales,
+            ptr_bias=impl.w13_bias,
+            ptr_D=gemm1_out,
+            rows_per_expert=rows_per_expert,
+            N=2 * impl.inter_size,
+            K=hidden_size,
+            num_experts=num_experts,
+            is_B_int4=impl.is_int4,
+            is_B_mxfp4=impl.is_mxfp4,
+        )
+
+        # Activation
+        act_out = torch.empty(
+            (num_moe_inputs, impl.inter_size * impl.inter_size_scale),
+            dtype=gemm1_out.dtype,
+            device=gemm1_out.device,
+        )
+        impl.act_func(act_out, gemm1_out)
+
+        # GEMM2: down projection
+        gemm2_out = torch.empty(
+            (num_moe_inputs, hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+            ptr_A=act_out,
+            ptr_B=impl.w2,
+            ptr_scales=impl.gemm2_scales,
+            ptr_bias=impl.w2_bias,
+            ptr_D=gemm2_out,
+            rows_per_expert=rows_per_expert,
+            N=hidden_size,
+            K=impl.inter_size * impl.inter_size_scale,
+            num_experts=num_experts,
+            is_B_int4=impl.is_int4,
+            is_B_mxfp4=impl.is_mxfp4,
+        )
+
+        # Fused unpermute + reduce_scatter
+        output = torch.empty(
+            (num_rows, hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        sbuf.unpermute_reducescatter_fusion(
+            expert_output=gemm2_out,
+            handle=symm_handle,
+            output=output,
+        )
+
+        # Shared experts on local chunk (no communication needed)
+        if self.shared_experts is not None:
+            output = output + self.shared_experts(hidden_states)
+
+        return output
+
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
             self.experts.finalize_weights()
@@ -851,6 +1008,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             and parallel_config.pipeline_parallel_size == 1
         )
         self.tp_size = get_tensor_model_parallel_world_size()
+        # DeepSymm fuse: AG+GEMM / GEMM+RS for attention
+        self.fuse_comms = self.use_sequence_parallel and _SP_FUSE_COMMS
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4XPUAttention(
@@ -991,30 +1150,53 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
             # SP: all-gather x from T/tp → T for attention
-            if input_is_sp:
+            if input_is_sp and not self.fuse_comms:
                 x = tensor_model_parallel_all_gather(x, 0)
                 x = x[:full_num_tokens]
 
         x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
+
+        if self.fuse_comms and input_is_sp:
+            # Fused path: AG+GEMM at input, GEMM+RS at output.
+            # x is [T/tp, H] from the previous layer's SP state.
+            from vllm.distributed import get_tp_group
+
+            group_name = get_tp_group().device_group.group_name
+            # Pad x to be divisible by tp_size before fused AG
+            sp_pad = (-x.shape[0]) % self.tp_size
+            if sp_pad > 0:
+                x = torch.nn.functional.pad(x, (0, 0, 0, sp_pad))
+            x = self.attn.forward_sp_fused(positions, x, group_name)
+        elif self.fuse_comms and not input_is_sp:
+            # First layer: x is full T, no AG needed, but use GEMM+RS at output.
+            from vllm.distributed import get_tp_group
+
+            group_name = get_tp_group().device_group.group_name
+            x = self.attn(positions, x, None)
+            # attn output is already [T, H] (reduce_results=False), reduce-scatter
+            sp_pad = (-x.shape[0]) % self.tp_size
+            x = torch.nn.functional.pad(x, (0, 0, 0, sp_pad))
+            x = tensor_model_parallel_reduce_scatter(x, 0)
+        else:
+            x = self.attn(positions, x, None)
 
         # SP: reduce-scatter attention output T → T/tp, chunk residual
-        if self.use_sequence_parallel:
+        if self.use_sequence_parallel and not self.fuse_comms:
             # Pad to make divisible by tp_size
             sp_pad = (-x.shape[0]) % self.tp_size
             x = torch.nn.functional.pad(x, (0, 0, 0, sp_pad))
             x = tensor_model_parallel_reduce_scatter(x, 0)
-            if not input_is_sp:
-                # First time entering SP: chunk the residual stream along dim 0
-                residual = sequence_parallel_chunk(residual.flatten(1)).unflatten(
-                    1, residual.shape[1:]
-                )
-                post_mix = sequence_parallel_chunk(post_mix.flatten(1)).unflatten(
-                    1, post_mix.shape[1:]
-                )
-                res_mix = sequence_parallel_chunk(res_mix.flatten(1)).unflatten(
-                    1, res_mix.shape[1:]
-                )
+        if self.use_sequence_parallel and not input_is_sp:
+            # First time entering SP: chunk the residual stream along dim 0
+            residual = sequence_parallel_chunk(residual.flatten(1)).unflatten(
+                1, residual.shape[1:]
+            )
+            post_mix = sequence_parallel_chunk(post_mix.flatten(1)).unflatten(
+                1, post_mix.shape[1:]
+            )
+            res_mix = sequence_parallel_chunk(res_mix.flatten(1)).unflatten(
+                1, res_mix.shape[1:]
+            )
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
